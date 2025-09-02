@@ -164,8 +164,21 @@ function confirme_add_categoria($category_name, $type, $is_adult, $bg)
 
     if ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
 
-        $sql_insert = "INSERT INTO categoria (nome, type, is_adult, bg, admin_id) 
-                        VALUES (:category_name, :type, :is_adult, :bg, :admin_id)";
+        // CORREÇÃO: Adicionar ordem automaticamente
+        try {
+            // Buscar próxima ordem para o tipo
+            $ordem_stmt = $conexao->prepare("SELECT COALESCE(MAX(ordem), 0) + 1 as proxima_ordem FROM categoria WHERE admin_id = :admin_id AND type = :type");
+            $ordem_stmt->bindParam(':admin_id', $admin_id, PDO::PARAM_INT);
+            $ordem_stmt->bindParam(':type', $type, PDO::PARAM_STR);
+            $ordem_stmt->execute();
+            $ordem_result = $ordem_stmt->fetch(PDO::FETCH_ASSOC);
+            $ordem = $ordem_result['proxima_ordem'];
+        } catch (Exception $e) {
+            $ordem = 1; // fallback
+        }
+
+        $sql_insert = "INSERT INTO categoria (nome, type, is_adult, bg, admin_id, ordem) 
+                        VALUES (:category_name, :type, :is_adult, :bg, :admin_id, :ordem)";
         $stmt_insert = $conexao->prepare($sql_insert);
 
         $stmt_insert->bindParam(':category_name', $category_name, PDO::PARAM_STR);
@@ -173,6 +186,7 @@ function confirme_add_categoria($category_name, $type, $is_adult, $bg)
         $stmt_insert->bindParam(':is_adult', $is_adult, PDO::PARAM_INT); 
         $stmt_insert->bindParam(':admin_id', $admin_id, PDO::PARAM_INT); 
         $stmt_insert->bindParam(':bg', $bg, PDO::PARAM_STR);
+        $stmt_insert->bindParam(':ordem', $ordem, PDO::PARAM_INT);
 
         if ($stmt_insert->execute()) {
             $lastInsertedId = $conexao->lastInsertId();
@@ -233,37 +247,43 @@ function confirme_delete_categorias($id, $name)
     if ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
 
         extract($row);
-        $tabela = 'streams';
-        if ($type === 'series') {
-            $tabela = 'series';
-        }
-
-        $sql_delete = "DELETE FROM categoria WHERE id = '$id' and admin_id = '$admin_id'";
-
-        if ($conexao->exec($sql_delete)) {
-            $sql_delete = "DELETE FROM $tabela WHERE category_id = '$id'";
+        
+        // CORREÇÃO: Exclusão segura com transação
+        try {
+            $conexao->beginTransaction();
+            
+            // Deletar conteúdos vinculados baseado no tipo
             if ($type === 'series') {
-               $sql_delete_episodios = "DELETE FROM series_episodes WHERE category_id = '$id'";
-               $series_seasons = "DELETE FROM series_seasons WHERE category_id = '$id'";
+                // Deletar episódios e temporadas das séries desta categoria
+                $conexao->prepare("DELETE FROM series_episodes WHERE category_id = ?")->execute([$id]);
+                $conexao->prepare("DELETE FROM series_seasons WHERE category_id = ?")->execute([$id]);
+                $conexao->prepare("DELETE FROM series WHERE category_id = ?")->execute([$id]);
+            } else {
+                // Deletar streams (canais e filmes) desta categoria
+                $conexao->prepare("DELETE FROM streams WHERE category_id = ?")->execute([$id]);
             }
 
-            if ($conexao->exec($sql_delete)) {
-                if ($type === 'series') {
-                    $conexao->exec($sql_delete_episodios);
-                    $conexao->exec($series_seasons);
-                }
-
+            // Deletar a categoria
+            $sql_delete = "DELETE FROM categoria WHERE id = :id AND admin_id = :admin_id";
+            $stmt_delete = $conexao->prepare($sql_delete);
+            $stmt_delete->bindParam(':id', $id, PDO::PARAM_INT);
+            $stmt_delete->bindParam(':admin_id', $admin_id, PDO::PARAM_INT);
+            
+            if ($stmt_delete->execute()) {
+                $conexao->commit();
                 $resposta['title'] = "Sucesso!";
-                $resposta['msg'] = "Categoria e todos os conteudos deletado com sucesso!";
+                $resposta['msg'] = "Categoria e todos os conteúdos vinculados deletados com sucesso!";
                 $resposta['icon'] = "success";
-                return $resposta;
+            } else {
+                $conexao->rollBack();
+                $resposta['title'] = "Erro!";
+                $resposta['msg'] = "Erro ao deletar categoria.";
+                $resposta['icon'] = "error";
             }
-            $resposta['title'] = "Sucesso!";
-            $resposta['msg'] = "Categoria deletado com sucesso!";
-            $resposta['icon'] = "success";
-        } else {
+        } catch (Exception $e) {
+            $conexao->rollBack();
             $resposta['title'] = "Erro!";
-            $resposta['msg'] = "Erro ao deletar Categoria.";
+            $resposta['msg'] = "Erro ao deletar categoria: " . $e->getMessage();
             $resposta['icon'] = "error";
         }
 
@@ -344,7 +364,7 @@ function edite_categorias($id)
         $modal_body .= '</div>';
 
         $modal_body .= '<div class="form-group pb-2"> Background SSIPTV:</div>';
-        $modal_body .= '<input type="text" class="form-control" name="gb_ssiptv" value="" placeholder="Foto de fundo para a categora no ssiptv">';    
+        $modal_body .= '<input type="text" class="form-control" name="gb_ssiptv" value="'.($bg ?? '').'" placeholder="Foto de fundo para a categora no ssiptv">';    
 
         $modal_footer = "<button type='button' onclick='enviardados(\"modal_master_form\", \"categorias.php\")' class='btn btn-success waves-effect waves-light' >Editar</button><button type='button' class='btn btn-danger' data-bs-dismiss='modal' aria-label='Close'>Cancelar</button>";
 
@@ -397,17 +417,20 @@ function confirme_editar_categoria($id, $category_name, $type, $is_adult, $bg)
         $stmt_update->bindParam(':admin_id', $admin_id, PDO::PARAM_INT);
 
         if ($stmt_update->execute()) {
-            $tabela = ($type === 'series') ? 'series' : 'streams';
-
-            $sql_update = "UPDATE $tabela 
-                       SET is_adult = :is_adult
-                       WHERE category_id = :category_id";
-            $stmt_update = $conexao->prepare($sql_update);
-
-            $stmt_update->bindParam(':is_adult', $is_adult, PDO::PARAM_INT);
-            $stmt_update->bindParam(':category_id', $id, PDO::PARAM_INT);
-            if ($stmt_update->execute()) {
+            // CORREÇÃO: Atualizar is_adult nos conteúdos vinculados
+            try {
+                $tabela = ($type === 'series') ? 'series' : 'streams';
+                $sql_update_content = "UPDATE $tabela 
+                           SET is_adult = :is_adult
+                           WHERE category_id = :category_id";
+                $stmt_update_content = $conexao->prepare($sql_update_content);
+                $stmt_update_content->bindParam(':is_adult', $is_adult, PDO::PARAM_INT);
+                $stmt_update_content->bindParam(':category_id', $id, PDO::PARAM_INT);
+                $stmt_update_content->execute();
+            } catch (Exception $e) {
+                // Continuar mesmo se a atualização do conteúdo falhar
             }
+            
             $resposta['title'] = "Concluído!";
             $resposta['msg'] = "Categoria atualizada com sucesso";
             $resposta['icon'] = "success";
@@ -423,3 +446,4 @@ function confirme_editar_categoria($id, $category_name, $type, $is_adult, $bg)
         return 0;
     }
 }
+?>
